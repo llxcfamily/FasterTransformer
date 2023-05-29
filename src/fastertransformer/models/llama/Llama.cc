@@ -160,6 +160,11 @@ void Llama<T>::allocateBuffer(
         context_decoder_input_buf_, sizeof(T) * batchxbeam * max_input_len * hidden_units_, false));
     context_decoder_output_buf_ = (T*)(allocator_->reMalloc(
         context_decoder_output_buf_, sizeof(T) * batchxbeam * max_input_len * hidden_units_, false));
+    normed_context_decoder_output_buf_ = (T*)(allocator_->reMalloc(
+        normed_context_decoder_output_buf_, sizeof(T) * batchxbeam * max_input_len * hidden_units_, false));
+    context_nccl_logits_buf_ =
+        (float*)(allocator_->reMalloc(context_nccl_logits_buf_,
+            sizeof(float) * batchxbeam * max_input_len * vocab_size_padded_, false));
     output_log_probs_buf_ =
         (float*)(allocator_->reMalloc(output_log_probs_buf_, sizeof(float) * batchxbeam * max_seq_len, false));
 
@@ -212,6 +217,8 @@ void Llama<T>::freeBuffer()
 
         allocator_->free((void**)(&context_decoder_input_buf_));
         allocator_->free((void**)(&context_decoder_output_buf_));
+        allocator_->free((void**)(&normed_context_decoder_output_buf_));
+        allocator_->free((void**)(&context_nccl_logits_buf_));
         allocator_->free((void**)(&output_log_probs_buf_));
 
         allocator_->free((void**)(&generation_should_stop_), true);
@@ -452,6 +459,11 @@ void Llama<T>::forward(std::unordered_map<std::string, Tensor>*       output_ten
     FT_CHECK(output_tensors->at("sequence_length").shape.size() == 2);
     FT_CHECK_WITH_INFO(input_tensors->at("input_ids").shape[0] == output_tensors->at("output_ids").shape[0],
                        "input_tensors->at(\"input_ids\").shape[0] == output_tensors->at(\"output_ids\").shape[0]");
+
+    float* output_logits_tensor = nullptr;
+    if (output_tensors->find("logits") != output_tensors->end()) {
+        output_logits_tensor = (float*)output_tensors->at("logits").data;
+    }
 
     const size_t batch_size = output_tensors->at("output_ids").shape[0];
     const size_t beam_width = output_tensors->at("output_ids").shape[1];
@@ -788,6 +800,79 @@ void Llama<T>::forward(std::unordered_map<std::string, Tensor>*       output_ten
                             batch_size,
                             beam_width,
                             stream_);
+
+    if (output_logits_tensor != nullptr) {
+        invokeGeneralT5LayerNorm(normed_context_decoder_output_buf_,
+                                 context_decoder_output_buf_,
+                                 gpt_weights->post_decoder_layernorm.gamma,
+                                 (const T*)nullptr,
+                                 layernorm_eps_,
+                                 batch_size * beam_width * max_input_length,
+                                 hidden_units_,
+                                 stream_);
+        sync_check_cuda_error();
+
+        if (tensor_para_.world_size_ == 1) {
+            float alpha = 1.0f;
+            float beta  = 0.0f;
+            cublas_wrapper_->Gemm(CUBLAS_OP_T,
+                                  CUBLAS_OP_N,
+                                  vocab_size_padded_,  // n
+                                  batch_size * beam_width * max_input_length,
+                                  hidden_units_,  // k
+                                  &alpha,
+                                  padded_embedding_kernel_ptr_,
+                                  gemm_data_type,
+                                  hidden_units_,  // k
+                                  normed_context_decoder_output_buf_,
+                                  gemm_data_type,
+                                  hidden_units_,  // k
+                                  &beta,
+                                  output_logits_tensor,
+                                  CUDA_R_32F,
+                                  vocab_size_padded_, /* n */
+                                  CUDA_R_32F,
+                                  cublasGemmAlgo_t(-1));
+        }
+        else {
+            FT_CHECK(vocab_size_padded_ % tensor_para_.world_size_ == 0);
+            const int local_vocab_size = vocab_size_padded_ / tensor_para_.world_size_;
+            float     alpha            = 1.0f;
+            float     beta             = 0.0f;
+            cublas_wrapper_->Gemm(CUBLAS_OP_T,
+                                  CUBLAS_OP_N,
+                                  local_vocab_size,  // n
+                                  batch_size * beam_width * max_input_length,
+                                  hidden_units_,  // k
+                                  &alpha,
+                                  padded_embedding_kernel_ptr_
+                                      + tensor_para_.rank_ * local_vocab_size * hidden_units_,
+                                  gemm_data_type,
+                                  hidden_units_,  // k
+                                  normed_context_decoder_output_buf_,
+                                  gemm_data_type,
+                                  hidden_units_,  // k
+                                  &beta,
+                                  context_nccl_logits_buf_ +
+                                    tensor_para_.rank_ * batch_size * beam_width * max_input_length * local_vocab_size,
+                                  CUDA_R_32F,
+                                  local_vocab_size, /* n */
+                                  CUDA_R_32F,
+                                  cublasGemmAlgo_t(-1));
+            ftNcclAllGather(context_nccl_logits_buf_,
+                            context_nccl_logits_buf_,
+                            batch_size * beam_width * max_input_length * local_vocab_size,
+                            tensor_para_.rank_,
+                            tensor_para_,
+                            stream_);
+            invokeTransposeAxis01(output_logits_tensor,
+                                  context_nccl_logits_buf_,
+                                  tensor_para_.world_size_,
+                                  batch_size * beam_width * max_input_length,
+                                  local_vocab_size,
+                                  stream_);
+        }
+    }
 
     for (int step = max_input_length; step < (int)max_output_seq_len; step++) {
         const int src_indir_idx = (step - max_input_length) % 2;

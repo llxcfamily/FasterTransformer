@@ -201,6 +201,11 @@ LlamaTritonModelInstance<T>::forward(std::shared_ptr<std::unordered_map<std::str
                                           ft::TYPE_FP32,
                                           std::vector<size_t>{request_batch_size, beam_width},
                                           d_cum_log_probs_}});
+        output_tensors.insert({"logits",
+                               ft::Tensor{ft::MEMORY_GPU,
+                                          ft::TYPE_FP32,
+                                          std::vector<size_t>{request_batch_size * beam_width, total_output_len - max_request_output_len, gpt_->getVocabSize()},
+                                          d_logits_}});
     }
     try {
         if (stream_cb_ != nullptr) {
@@ -246,6 +251,7 @@ void LlamaTritonModelInstance<T>::allocateBuffer(const size_t request_batch_size
         d_output_log_probs_, sizeof(float) * request_batch_size * beam_width * max_request_output_len, false));
     d_cum_log_probs_ =
         (float*)(allocator_->reMalloc(d_cum_log_probs_, sizeof(float) * request_batch_size * beam_width, false));
+    d_logits_ = (float*)(allocator_->reMalloc(d_logits_, sizeof(float) * request_batch_size * beam_width * (total_output_len - max_request_output_len) * gpt_->getVocabSize(), false));
 }
 
 template<typename T>
@@ -255,6 +261,7 @@ void LlamaTritonModelInstance<T>::freeBuffer()
     allocator_->free((void**)(&d_sequence_lengths_));
     allocator_->free((void**)(&d_output_log_probs_));
     allocator_->free((void**)(&d_cum_log_probs_));
+    allocator_->free((void**)(&d_logits_));
 }
 
 template struct LlamaTritonModelInstance<float>;

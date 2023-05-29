@@ -122,6 +122,8 @@ protected:
 
     T*     context_decoder_input_buf_;
     T*     context_decoder_output_buf_;
+    T*     normed_context_decoder_output_buf_;
+    float* context_nccl_logits_buf_;
     float* output_log_probs_buf_;
 
     // function pointer callback
@@ -218,6 +220,10 @@ public:
 
     void registerCallback(callback_sig* fn, void* ctx);
     void unRegisterCallback();
+
+    size_t getVocabSize() {
+        return vocab_size_padded_;
+    }
 };
 
 }  // namespace fastertransformer
