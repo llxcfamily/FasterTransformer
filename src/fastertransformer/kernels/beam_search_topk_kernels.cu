@@ -603,7 +603,6 @@ void invokeTopkBeamSearch(void*           workspace,
     assert(beam_width <= vocab_size);
     // Beam search needs the sequence lengths of beams to apply length penalty.
     assert(length_penalty == 0.0f || sequence_lengths != nullptr);
-    FT_LOG_INFO("#######length_penalty=%f#######", length_penalty);
 
     const int max_block_per_beam      = 8;
     int       temp_log_probs_buf_size = batch_size * beam_width * vocab_size;                       // type float
