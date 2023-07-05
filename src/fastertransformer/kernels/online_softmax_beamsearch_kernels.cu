@@ -573,7 +573,6 @@ void topK_softMax_kernelLauncher(const T*        log_probs,
     assert(temp_storage_size >= 2 * batch_size * beam_width * beam_width * 2);
     // Beam search needs the sequence lengths of beams to apply length penalty.
     assert(length_penalty == 0.0f || sequence_lengths != nullptr);
-    FT_LOG_INFO("#######length_penalty=%f#######", length_penalty);
 
     const int topk_buf_offset  = ceil(batch_size * beam_width * beam_width * 2 / 4.) * 4;
     int*      topk_tmp_id_buf  = reinterpret_cast<int*>(temp_storage);

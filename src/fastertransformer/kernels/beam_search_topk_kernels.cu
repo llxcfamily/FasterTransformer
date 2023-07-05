@@ -285,6 +285,7 @@ __global__ void topk_stage_2_opt3(const int* __restrict topk_tmp_id_buf,
                 }
                 else {
                     const int   global_batch_idx = beam_hyps.ite * beam_hyps.local_batch_size + batch_id;
+
                     const float normed_score =
                         apply_length_penalty(s_val[total.p], beam_hyps.step, beam_hyps.length_penalty);
                     const int num_beam = beam_hyps.num_beams[global_batch_idx];
