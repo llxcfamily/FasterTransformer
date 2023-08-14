@@ -1,0 +1,896 @@
+diff -r src/fastertransformer/kernels/beam_search_topk_kernels.cu tmp/FasterTransformer/src/fastertransformer/kernels/beam_search_topk_kernels.cu
+288d287
+< 
+606d604
+< 
+diff -r src/fastertransformer/layers/adapter_layers/LinearAdapterLayer.cc tmp/FasterTransformer/src/fastertransformer/layers/adapter_layers/LinearAdapterLayer.cc
+91c91,92
+<                                                  enable_custom_all_reduce)},
+---
+>                                                  enable_custom_all_reduce,
+>                                                  0)},
+diff -r src/fastertransformer/layers/FfnLayer.cc tmp/FasterTransformer/src/fastertransformer/layers/FfnLayer.cc
+84c84
+<     const bool use_gated_activation = use_gated_activation_ && ffn_weights->intermediate_weight2.kernel != nullptr;
+---
+>     const bool use_gated_activation = use_gated_activation_ && (ffn_weights->intermediate_weight2.kernel != nullptr || ffn_weights->intermediate_weight2.int8_kernel != nullptr);
+686a687
+>                               int              int8_mode,
+699c700
+<                 0,
+---
+>                 int8_mode,
+diff -r src/fastertransformer/layers/FfnLayer.h tmp/FasterTransformer/src/fastertransformer/layers/FfnLayer.h
+212a213
+>                  int              int8_mode            = 0,
+diff -r src/fastertransformer/layers/TensorParallelSiluFfnLayer.cc tmp/FasterTransformer/src/fastertransformer/layers/TensorParallelSiluFfnLayer.cc
+79c79,80
+<                                                           int                                 enable_custom_all_reduce):
+---
+>                                                           int                                 enable_custom_all_reduce,
+>                                                           int              int8_mode):
+90a92
+>                     int8_mode,
+diff -r src/fastertransformer/layers/TensorParallelSiluFfnLayer.h tmp/FasterTransformer/src/fastertransformer/layers/TensorParallelSiluFfnLayer.h
+50c50,51
+<                                int                                 enable_custom_all_reduce = 0);
+---
+>                                int                                 enable_custom_all_reduce = 0,
+>                                int                                 int8_mode                = 0);
+diff -r src/fastertransformer/models/llama/Llama.cc tmp/FasterTransformer/src/fastertransformer/models/llama/Llama.cc
+44a45
+>                                                       int8_mode_,
+61a63
+>                                        int8_mode_,
+109,111d110
+< 
+<         padded_embedding_bias_ =
+<             (T*)(allocator_->reMalloc(padded_embedding_bias_, sizeof(T) * vocab_size_padded_, true));
+163,167d161
+<     normed_context_decoder_output_buf_ = (T*)(allocator_->reMalloc(
+<         normed_context_decoder_output_buf_, sizeof(T) * batchxbeam * max_input_len * hidden_units_, false));
+<     context_nccl_logits_buf_ =
+<         (float*)(allocator_->reMalloc(context_nccl_logits_buf_,
+<             sizeof(float) * batchxbeam * max_input_len * vocab_size_padded_, false));
+172a167,173
+>     if (shared_contexts_ratio_ > 0.0f) {
+>         shared_contexts_idx_  = (int*)allocator_->reMalloc(shared_contexts_idx_, batch_size * sizeof(int), false);
+>         batch_to_compact_idx_ = (int*)allocator_->reMalloc(batch_to_compact_idx_, batchxbeam * sizeof(int), false);
+>         compact_idx_          = (int*)allocator_->reMalloc(compact_idx_, batch_size * sizeof(int), false);
+>         compact_size_         = (int*)allocator_->reMalloc(compact_size_, sizeof(int), false);
+>     }
+> 
+183d183
+<             allocator_->free((void**)(&padded_embedding_bias_));
+220,221d219
+<         allocator_->free((void**)(&normed_context_decoder_output_buf_));
+<         allocator_->free((void**)(&context_nccl_logits_buf_));
+225a224,228
+>         if (shared_contexts_ratio_ > 0.0f) {
+>             allocator_->free((void**)(&shared_contexts_idx_));
+>             allocator_->free((void**)(&compact_size_));
+>         }
+> 
+255a259
+>                 int                                 int8_mode,
+257c261,262
+<                 int                                 enable_custom_all_reduce):
+---
+>                 int                                 enable_custom_all_reduce,
+>                 float                               shared_contexts_ratio):
+273c278,280
+<     attention_type_(attention_type)
+---
+>     attention_type_(attention_type),
+>     int8_mode_(int8_mode),
+>     shared_contexts_ratio_(shared_contexts_ratio)
+319a327
+>                 int                                 int8_mode,
+321c329,330
+<                 int                                 enable_custom_all_reduce):
+---
+>                 int                                 enable_custom_all_reduce,
+>                 float                               shared_contexts_ratio):
+341c350,352
+<     attention_type_(attention_type)
+---
+>     attention_type_(attention_type),
+>     int8_mode_(int8_mode),
+>     shared_contexts_ratio_(shared_contexts_ratio)
+373c384,386
+<     attention_type_(gpt.attention_type_)
+---
+>     attention_type_(gpt.attention_type_),
+>     int8_mode_(gpt.int8_mode_),
+>     shared_contexts_ratio_(gpt.shared_contexts_ratio_)
+463,467d475
+<     float* output_logits_tensor = nullptr;
+<     if (output_tensors->find("logits") != output_tensors->end()) {
+<         output_logits_tensor = (float*)output_tensors->at("logits").data;
+<     }
+< 
+599a608,624
+>     int  compact_size;
+>     bool use_shared_contexts = (shared_contexts_ratio_ > 0.0f) && (max_input_length >= 1) && (batch_size > 1);
+>     if (use_shared_contexts) {
+>         invokeFindContextDups(shared_contexts_idx_,
+>                               batch_to_compact_idx_,
+>                               compact_idx_,
+>                               compact_size_,
+>                               input_tensors->at("input_ids").getPtr<int>(),
+>                               batch_size,
+>                               beam_width,
+>                               max_input_length,
+>                               stream_);
+>         cudaD2Hcpy(&compact_size, compact_size_, 1);
+>         use_shared_contexts = compact_size <= shared_contexts_ratio_ * batch_size;
+>         sync_check_cuda_error();
+>     }
+> 
+700a726,733
+>         if (use_shared_contexts) {
+>             decoder_input_tensors.insert(
+>                 {"compact_idx", Tensor(MEMORY_GPU, TYPE_INT32, {(size_t)compact_size}, compact_idx_)});
+>             decoder_input_tensors.insert(
+>                 {"batch_to_compact_idx",
+>                  Tensor(MEMORY_GPU, TYPE_INT32, {batch_size * beam_width}, batch_to_compact_idx_)});
+>         }
+> 
+786,790d818
+<         cudaMemcpyAsync(padded_embedding_bias_,
+<                         gpt_weights->post_decoder_embedding.bias,
+<                         sizeof(T) * vocab_size_,
+<                         cudaMemcpyDeviceToDevice,
+<                         stream_);
+804,876d831
+<     if (output_logits_tensor != nullptr) {
+<         invokeGeneralT5LayerNorm(normed_context_decoder_output_buf_,
+<                                  context_decoder_output_buf_,
+<                                  gpt_weights->post_decoder_layernorm.gamma,
+<                                  (const T*)nullptr,
+<                                  layernorm_eps_,
+<                                  batch_size * beam_width * max_input_length,
+<                                  hidden_units_,
+<                                  stream_);
+<         sync_check_cuda_error();
+< 
+<         if (tensor_para_.world_size_ == 1) {
+<             float alpha = 1.0f;
+<             float beta  = 0.0f;
+<             cublas_wrapper_->Gemm(CUBLAS_OP_T,
+<                                   CUBLAS_OP_N,
+<                                   vocab_size_padded_,  // n
+<                                   batch_size * beam_width * max_input_length,
+<                                   hidden_units_,  // k
+<                                   &alpha,
+<                                   padded_embedding_kernel_ptr_,
+<                                   gemm_data_type,
+<                                   hidden_units_,  // k
+<                                   normed_context_decoder_output_buf_,
+<                                   gemm_data_type,
+<                                   hidden_units_,  // k
+<                                   &beta,
+<                                   output_logits_tensor,
+<                                   CUDA_R_32F,
+<                                   vocab_size_padded_, /* n */
+<                                   CUDA_R_32F,
+<                                   cublasGemmAlgo_t(-1));
+<         }
+<         else {
+<             FT_CHECK(vocab_size_padded_ % tensor_para_.world_size_ == 0);
+<             const int local_vocab_size = vocab_size_padded_ / tensor_para_.world_size_;
+<             float     alpha            = 1.0f;
+<             float     beta             = 0.0f;
+<             cublas_wrapper_->Gemm(CUBLAS_OP_T,
+<                                   CUBLAS_OP_N,
+<                                   local_vocab_size,  // n
+<                                   batch_size * beam_width * max_input_length,
+<                                   hidden_units_,  // k
+<                                   &alpha,
+<                                   padded_embedding_kernel_ptr_
+<                                       + tensor_para_.rank_ * local_vocab_size * hidden_units_,
+<                                   gemm_data_type,
+<                                   hidden_units_,  // k
+<                                   normed_context_decoder_output_buf_,
+<                                   gemm_data_type,
+<                                   hidden_units_,  // k
+<                                   &beta,
+<                                   context_nccl_logits_buf_ +
+<                                     tensor_para_.rank_ * batch_size * beam_width * max_input_length * local_vocab_size,
+<                                   CUDA_R_32F,
+<                                   local_vocab_size, /* n */
+<                                   CUDA_R_32F,
+<                                   cublasGemmAlgo_t(-1));
+<             ftNcclAllGather(context_nccl_logits_buf_,
+<                             context_nccl_logits_buf_,
+<                             batch_size * beam_width * max_input_length * local_vocab_size,
+<                             tensor_para_.rank_,
+<                             tensor_para_,
+<                             stream_);
+<             invokeTransposeAxis01(output_logits_tensor,
+<                                   context_nccl_logits_buf_,
+<                                   tensor_para_.world_size_,
+<                                   batch_size * beam_width * max_input_length,
+<                                   local_vocab_size,
+<                                   stream_);
+<         }
+<     }
+< 
+964a920
+>                 
+1011a968,969
+>                     
+> 
+1025c983,984
+< 
+---
+>                 
+>                 
+1317d1275
+< 
+diff -r src/fastertransformer/models/llama/LlamaContextDecoder.cc tmp/FasterTransformer/src/fastertransformer/models/llama/LlamaContextDecoder.cc
+43c43
+<                                                                           0,
+---
+>                                                                           int8_mode_,
+46a47
+> 
+62c63,64
+<                                                    enable_custom_all_reduce_);
+---
+>                                                    enable_custom_all_reduce_,
+>                                                    int8_mode_); 
+72c74
+< void LlamaContextDecoder<T>::allocateBuffer(size_t batch_size, size_t seq_len)
+---
+> void LlamaContextDecoder<T>::allocateBuffer(size_t batch_size, size_t seq_len, bool use_shared_contexts)
+85a88,101
+>     
+>     if (use_shared_contexts) {
+>         compact_decoder_features_ = reinterpret_cast<T*>(
+>             allocator_->reMalloc(compact_decoder_features_, sizeof(T) * batch_size * seq_len * hidden_units_, false));
+>         compact_attention_mask_ = reinterpret_cast<T*>(
+>             allocator_->reMalloc(compact_attention_mask_, sizeof(T) * batch_size * seq_len * seq_len, false));
+>         compact_input_lengths_ =
+>             reinterpret_cast<int*>(allocator_->reMalloc(compact_input_lengths_, sizeof(int) * batch_size, false));
+>         k_cache_layer_ = reinterpret_cast<T*>(
+>             allocator_->reMalloc(k_cache_layer_, sizeof(T) * batch_size * seq_len * hidden_units_, false));
+>         v_cache_layer_ = reinterpret_cast<T*>(
+>             allocator_->reMalloc(v_cache_layer_, sizeof(T) * batch_size * seq_len * hidden_units_, false));
+>     }
+> 
+99a116,122
+>         if (compact_decoder_features_ != nullptr) {
+>             allocator_->free((void**)(&compact_decoder_features_));
+>             allocator_->free((void**)(&compact_attention_mask_));
+>             allocator_->free((void**)(&compact_input_lengths_));
+>             allocator_->free((void**)(&k_cache_layer_));
+>             allocator_->free((void**)(&v_cache_layer_));
+>         }
+149a173
+>                                             int                                 int8_mode,
+165a190
+>     int8_mode_(int8_mode),
+187a213
+>     int8_mode_(decoder.int8_mode_),
+241c267
+<     FT_CHECK(input_tensors->size() == 5);
+---
+>     FT_CHECK(input_tensors->size() >= 5);
+244,245c270,279
+<     const int batch_size = input_tensors->at("decoder_input").shape[0];
+<     const int seq_len    = input_tensors->at("decoder_input").shape[1];
+---
+>     const bool use_shared_contexts = input_tensors->find("compact_idx") != input_tensors->end();
+>     FT_CHECK(!use_shared_contexts || (input_tensors->find("batch_to_compact_idx") != input_tensors->end()));
+>     const size_t request_batch_size = input_tensors->at("decoder_input").shape[0];
+>     // compacted batch size.
+>     const size_t batch_size =
+>         use_shared_contexts ? input_tensors->at("compact_idx").shape[0] : input_tensors->at("decoder_input").shape[0];
+>     const int seq_len = input_tensors->at("decoder_input").shape[1];  // max_input_len
+>     // The maximum length of generation.
+>     const size_t max_seq_len = output_tensors->at("value_cache").shape[3];
+> 
+249c283
+<     allocateBuffer(batch_size, seq_len);
+---
+>     allocateBuffer(batch_size, seq_len, use_shared_contexts);
+256a291,304
+>     if (use_shared_contexts) {
+>         invokeCompactInputs(compact_decoder_features_,
+>                             compact_attention_mask_,
+>                             compact_input_lengths_,
+>                             decoder_input,
+>                             attention_mask,
+>                             input_tensors->at("input_lengths").getPtr<int>(),
+>                             input_tensors->at("compact_idx").getPtr<int>(),
+>                             batch_size,
+>                             seq_len,
+>                             hidden_units_,
+>                             stream_);
+>     }
+> 
+273a322,327
+>     if (use_shared_contexts) {
+>         // we use k_cache_layer_ and v_cache_layer_
+>         self_k_cache_size[3] = seq_len;
+>         self_v_cache_size[2] = seq_len;
+>     }
+> 
+282c336,337
+<             const int* base_input_lengths = input_tensors->at("input_lengths").getPtr<int>();
+---
+>             const int* base_input_lengths =
+>                 use_shared_contexts ? compact_input_lengths_ : input_tensors->at("input_lengths").getPtr<int>();
+297a353
+>                 const T* base_input = (use_shared_contexts ? compact_decoder_features_ : decoder_input);
+299c355
+<                                     decoder_input + ite * local_batch_size * seq_len * hidden_units_,
+---
+>                                     base_input + ite * local_batch_size * seq_len * hidden_units_,
+311c367
+<                     layer_input = decoder_input;
+---
+>                     layer_input = use_shared_contexts ? compact_decoder_features_ : decoder_input;
+315c371
+<                     layer_output = decoder_output;
+---
+>                     layer_output = use_shared_contexts ? compact_decoder_features_ : decoder_output;
+331c387
+< 
+---
+>             // TODO: 这里用的LN跟neox不一样，不太清楚这里需不需要改成int8的LN
+339a396
+> 
+341a399,400
+>             const T* attention_ptr = use_shared_contexts ? compact_attention_mask_ : attention_mask;
+> 
+349c408
+<                         attention_mask + local_batch_size * ite * seq_len * (seq_len + max_prompt_length)}},
+---
+>                         attention_ptr + local_batch_size * ite * seq_len * (seq_len + max_prompt_length)}},
+383a443,445
+>             T* k_cache_ptr = use_shared_contexts ? k_cache_layer_ : k_cache.getPtrWithOffset<T>(cache_offset);
+>             T* v_cache_ptr = use_shared_contexts ? v_cache_layer_ : v_cache.getPtrWithOffset<T>(cache_offset);
+> 
+387,389c449,450
+<                 {"key_cache", Tensor{MEMORY_GPU, data_type, self_k_cache_size, k_cache.getPtrWithOffset(cache_offset)}},
+<                 {"value_cache",
+<                  Tensor{MEMORY_GPU, data_type, self_v_cache_size, v_cache.getPtrWithOffset(cache_offset)}}};
+---
+>                 {"key_cache", Tensor{MEMORY_GPU, data_type, self_k_cache_size, k_cache_ptr}},
+>                 {"value_cache", Tensor{MEMORY_GPU, data_type, self_v_cache_size, v_cache_ptr}}};
+394a456,479
+>             if (use_shared_contexts) {
+>                 // Even with local batches, we must process the whole K/V caches as any
+>                 // element in batch_idx_to_compact_idx may reference the local batch
+>                 // we're processing. We also need to discard references that aren't in
+>                 // that particular local batch.
+>                 const size_t cache_stride_per_batch = hidden_units_ / tensor_para_.world_size_ * max_seq_len;
+>                 const size_t cache_layer_offset =
+>                     (l - getFirstLayerParallelId()) * request_batch_size * cache_stride_per_batch;
+>                 invokeUnCompactCaches(k_cache.getPtrWithOffset<T>(cache_layer_offset),
+>                                       v_cache.getPtrWithOffset<T>(cache_layer_offset),
+>                                       k_cache_layer_,
+>                                       v_cache_layer_,
+>                                       input_tensors->at("batch_to_compact_idx").getPtr<int>(),
+>                                       request_batch_size,  // batch_size (uncompact)
+>                                       v_cache.shape[2],    // local_head_num
+>                                       max_seq_len,
+>                                       seq_len,
+>                                       size_per_head_,
+>                                       local_batch_size,
+>                                       ite,
+>                                       stream_);
+>                 sync_check_cuda_error();
+>             }
+> 
+405c490
+<                                            0,
+---
+>                                            int8_mode_,
+408a494
+>                     // TODO: modify or not ?
+475c561,562
+<                     invokeRebuildPadding(decoder_output + ite * local_batch_size * seq_len * hidden_units_,
+---
+>                     T* base_ptr = use_shared_contexts ? compact_decoder_features_ : decoder_output;
+>                     invokeRebuildPadding(base_ptr + ite * local_batch_size * seq_len * hidden_units_,
+485a573,582
+>     if (use_shared_contexts) {
+>         invokeUnCompactOutputs(decoder_output,
+>                                compact_decoder_features_,
+>                                input_tensors->at("batch_to_compact_idx").getPtr<int>(),
+>                                request_batch_size,  // batch
+>                                seq_len * hidden_units_,
+>                                stream_);
+>         sync_check_cuda_error();
+>     }
+> 
+491c588
+<                                        batch_size,
+---
+>                                        request_batch_size,
+diff -r src/fastertransformer/models/llama/LlamaContextDecoder.h tmp/FasterTransformer/src/fastertransformer/models/llama/LlamaContextDecoder.h
+58a59,60
+>     int int8_mode_ = 0;
+> 
+65c67
+<     void allocateBuffer(size_t batch_size, size_t seq_len);
+---
+>     void allocateBuffer(size_t batch_size, size_t seq_len, bool use_shared_contexts);
+83a86,91
+>     T*   compact_decoder_features_ = nullptr;
+>     T*   compact_attention_mask_   = nullptr;
+>     int* compact_input_lengths_    = nullptr;
+>     T*   k_cache_layer_            = nullptr;
+>     T*   v_cache_layer_            = nullptr;
+> 
+100a109
+>                         int                                 int8_mode                = 0,
+diff -r src/fastertransformer/models/llama/LlamaDecoder.cc tmp/FasterTransformer/src/fastertransformer/models/llama/LlamaDecoder.cc
+38c38
+<                                                                            0,
+---
+>                                                                            int8_mode_,
+41a42
+>     // TODO: SiLu ftn layer not support int8
+57c58,59
+<                                                    enable_custom_all_reduce_);
+---
+>                                                    enable_custom_all_reduce_,
+>                                                    int8_mode_); 
+135a138
+>                               int                                 int8_mode,
+149a153
+>     int8_mode_(int8_mode),
+169a174
+>     int8_mode_(decoder.int8_mode_),
+262a268
+>         // TODO 使用的是T5 LN，这里是没有int8的参数支持
+304c310
+<                                    0,
+---
+>                                    int8_mode_,
+diff -r src/fastertransformer/models/llama/LlamaDecoder.h tmp/FasterTransformer/src/fastertransformer/models/llama/LlamaDecoder.h
+72a73,74
+>     int int8_mode_ = 0;
+> 
+87a90
+>                  int                                 int8_mode                 = 0,
+diff -r src/fastertransformer/models/llama/LlamaDecoderLayerWeight.cc tmp/FasterTransformer/src/fastertransformer/models/llama/LlamaDecoderLayerWeight.cc
+27c27,28
+<                                                     const bool use_gptj_residual):
+---
+>                                                     const bool use_gptj_residual,
+>                                                     const int  int8_mode):
+31a33
+>     int8_mode_(int8_mode),
+35a38,46
+> 
+>     FT_CHECK_WITH_INFO(int8_mode_ != 2, "Llama doesn't support int8_model == 2");
+>     FT_CHECK_WITH_INFO(!(std::is_same<T, float>::value && int8_mode_ == 1),
+>                        "Weight only quant does not work with FP32 compute.");
+> }
+> 
+> template<typename T>
+> LlamaDecoderLayerWeight<T>::LlamaDecoderLayerWeight(const int int8_mode): int8_mode_(int8_mode)
+> {
+42c53
+<         for (int i = 0; i < 12; i++) {
+---
+>         for (int i = 0; i < 14; i++) {
+62a74,103
+> 
+>         if (int8_mode_ != 0) {
+>             for (int i = 0; i < int8_weights_ptr.size(); i++) {
+>                 if (int8_weights_ptr[i] != nullptr) {
+>                     deviceFree(int8_weights_ptr[i]);
+>                 }
+>             }
+> 
+>             if (int8_mode_ == 1) {
+>                 for (int i = 0; i < weight_only_scale_ptr.size(); i++) {
+>                     if (weight_only_scale_ptr[i] != nullptr) {
+>                         deviceFree(weight_only_scale_ptr[i]);
+>                     }
+>                 }
+>             }
+> 
+>             self_attention_weights.query_weight.int8_kernel                             = nullptr;
+>             self_attention_weights.query_weight.weight_only_quant_scale                 = nullptr;
+>             self_attention_weights.attention_output_weight.int8_kernel                  = nullptr;
+>             self_attention_weights.attention_output_weight.weight_only_quant_scale      = nullptr;
+> 
+>             //  作一下标记  intermediate_weight => gate_proj;  intermediate_weight2 => up_proj; output_weight => down_proj.
+>             ffn_weights.intermediate_weight.int8_kernel                                 = nullptr;
+>             ffn_weights.intermediate_weight.weight_only_quant_scale                     = nullptr;
+>             ffn_weights.intermediate_weight2.int8_kernel                                = nullptr;
+>             ffn_weights.intermediate_weight2.weight_only_quant_scale                    = nullptr;
+>             ffn_weights.output_weight.int8_kernel                                       = nullptr;
+>             ffn_weights.output_weight.weight_only_quant_scale                           = nullptr;
+>         }
+> 
+68,73c109
+< LlamaDecoderLayerWeight<T>::LlamaDecoderLayerWeight(const LlamaDecoderLayerWeight& other):
+<     hidden_units_(other.hidden_units_),
+<     inter_size_(other.inter_size_),
+<     tensor_para_size_(other.tensor_para_size_),
+<     tensor_para_rank_(other.tensor_para_rank_),
+<     use_gptj_residual_(other.use_gptj_residual_)
+---
+> void LlamaDecoderLayerWeight<T>::copyFrom(const LlamaDecoderLayerWeight& other)
+75d110
+<     mallocWeights();
+78d112
+<     cudaD2Dcpy(weights_ptr[2], other.weights_ptr[2], hidden_units_ * 3 * hidden_units_ / tensor_para_size_);
+80d113
+<     cudaD2Dcpy(weights_ptr[4], other.weights_ptr[4], hidden_units_ / tensor_para_size_ * hidden_units_);
+84,85d116
+< 
+<     cudaD2Dcpy(weights_ptr[6], other.weights_ptr[6], hidden_units_ * inter_size_ / tensor_para_size_);
+87,88d117
+< 
+<     cudaD2Dcpy(weights_ptr[8], other.weights_ptr[8], hidden_units_ * inter_size_ / tensor_para_size_);
+90,91d118
+< 
+<     cudaD2Dcpy(weights_ptr[10], other.weights_ptr[10], inter_size_ / tensor_para_size_ * hidden_units_);
+94a122,159
+> 
+>     if (int8_mode_ == 0) {
+>         cudaD2Dcpy(weights_ptr[2], other.weights_ptr[2], hidden_units_ * 3 * hidden_units_ / tensor_para_size_);
+>         cudaD2Dcpy(weights_ptr[4], other.weights_ptr[4], hidden_units_ / tensor_para_size_ * hidden_units_);
+>         cudaD2Dcpy(weights_ptr[6], other.weights_ptr[6], hidden_units_ * inter_size_ / tensor_para_size_);
+>         cudaD2Dcpy(weights_ptr[8], other.weights_ptr[8], hidden_units_ * inter_size_ / tensor_para_size_);
+>         cudaD2Dcpy(weights_ptr[10], other.weights_ptr[10], inter_size_ / tensor_para_size_ * hidden_units_);
+>     }
+>     else {
+>         cudaD2Dcpy(int8_weights_ptr[0], other.int8_weights_ptr[0], hidden_units_ * 3 * hidden_units_ / tensor_para_size_);
+>         cudaD2Dcpy(int8_weights_ptr[1], other.int8_weights_ptr[1], hidden_units_ / tensor_para_size_ * hidden_units_);
+>         cudaD2Dcpy(int8_weights_ptr[2], other.int8_weights_ptr[2], hidden_units_ * inter_size_ / tensor_para_size_);
+>         cudaD2Dcpy(int8_weights_ptr[3], other.int8_weights_ptr[3], hidden_units_ * inter_size_ / tensor_para_size_);
+>         cudaD2Dcpy(int8_weights_ptr[4], other.int8_weights_ptr[4], inter_size_ / tensor_para_size_ * hidden_units_);
+>         
+>         if (int8_mode_ == 1) {
+>             cudaD2Dcpy(weight_only_scale_ptr[0], other.weight_only_scale_ptr[0], 3 * hidden_units_ / tensor_para_size_);
+>             cudaD2Dcpy(weight_only_scale_ptr[1], other.weight_only_scale_ptr[1], hidden_units_);
+>             cudaD2Dcpy(weight_only_scale_ptr[2], other.weight_only_scale_ptr[2], inter_size_ / tensor_para_size_);
+> 
+>             // TODO: 不太清楚这里存的缩放因子对应的是gate_pro_weight 还是给 up_proj/down_proj用的，后面做一下验证，回来再改一下
+>             cudaD2Dcpy(weight_only_scale_ptr[3], other.weight_only_scale_ptr[3], inter_size_ / tensor_para_size_);
+>             cudaD2Dcpy(weight_only_scale_ptr[4], other.weight_only_scale_ptr[4], hidden_units_);
+>         }
+>     }
+> }
+> 
+> template<typename T>
+> LlamaDecoderLayerWeight<T>::LlamaDecoderLayerWeight(const LlamaDecoderLayerWeight& other):
+>     hidden_units_(other.hidden_units_),
+>     inter_size_(other.inter_size_),
+>     tensor_para_size_(other.tensor_para_size_),
+>     tensor_para_rank_(other.tensor_para_rank_),
+>     int8_mode_(other.int8_mode_),
+>     use_gptj_residual_(other.use_gptj_residual_)
+> {
+>     mallocWeights();
+>     copyFrom(other);
+104a170
+>     int8_mode_          = other.int8_mode_;
+109,124c175
+<     cudaD2Dcpy(weights_ptr[0], other.weights_ptr[0], hidden_units_);
+<     cudaD2Dcpy(weights_ptr[1], other.weights_ptr[1], hidden_units_);
+<     cudaD2Dcpy(weights_ptr[2], other.weights_ptr[2], hidden_units_ * 3 * hidden_units_ / tensor_para_size_);
+<     cudaD2Dcpy(weights_ptr[3], other.weights_ptr[3], 3 * hidden_units_ / tensor_para_size_);
+<     cudaD2Dcpy(weights_ptr[4], other.weights_ptr[4], hidden_units_ / tensor_para_size_ * hidden_units_);
+<     if (!use_gptj_residual_) {
+<         cudaD2Dcpy(weights_ptr[5], other.weights_ptr[5], hidden_units_);
+<     }
+<     cudaD2Dcpy(weights_ptr[6], other.weights_ptr[6], hidden_units_ * inter_size_ / tensor_para_size_);
+<     cudaD2Dcpy(weights_ptr[7], other.weights_ptr[7], inter_size_ / tensor_para_size_);
+<     cudaD2Dcpy(weights_ptr[8], other.weights_ptr[8], hidden_units_ * inter_size_ / tensor_para_size_);
+<     cudaD2Dcpy(weights_ptr[9], other.weights_ptr[9], inter_size_ / tensor_para_size_);
+<     cudaD2Dcpy(weights_ptr[10], other.weights_ptr[10], inter_size_ / tensor_para_size_ * hidden_units_);
+<     cudaD2Dcpy(weights_ptr[11], other.weights_ptr[11], hidden_units_);
+<     cudaD2Dcpy(weights_ptr[12], other.weights_ptr[12], hidden_units_);
+<     cudaD2Dcpy(weights_ptr[13], other.weights_ptr[13], hidden_units_);
+---
+>     copyFrom(other);
+140c191,220
+<     loadWeightFromBin<T>(weights_ptr[2],
+---
+>     deviceFill(weights_ptr[3], (size_t)(3 * hidden_units_ / tensor_para_size_), (T)0.0);
+> 
+>     if (!use_gptj_residual_) {
+>         deviceFill(weights_ptr[5], (size_t)hidden_units_, (T)0.0);
+>     }
+> 
+>     // FIXME(sunpeng17): check if the weights are correct
+>     // loadWeightFromBin<T>(weights_ptr[6],
+>     //                      {(size_t)hidden_units_, (size_t)(inter_size_ / tensor_para_size_)},
+>     //                      dir_path + ".mlp.gate_proj.weight." + rank_spec + ".bin",
+>     //                      model_file_type);
+> 
+>     deviceFill(weights_ptr[7], (size_t)(inter_size_ / tensor_para_size_), (T)0.0);
+> 
+>     deviceFill(weights_ptr[9], (size_t)(inter_size_ / tensor_para_size_), (T)0.0);
+> 
+>     // loadWeightFromBin<T>(weights_ptr[10],
+>     //                      {(size_t)(inter_size_ / tensor_para_size_), (size_t)hidden_units_},
+>     //                      dir_path + ".mlp.down_proj.weight." + rank_spec + ".bin",
+>     //                      model_file_type);
+> 
+> 
+>     deviceFill(weights_ptr[11], (size_t)(hidden_units_), (T)0.0);
+> 
+>     deviceFill(weights_ptr[12], (size_t)(hidden_units_), (T)0.0);
+>     loadWeightFromBin<T>(
+>         weights_ptr[13], {(size_t)hidden_units_}, dir_path + ".post_attention_layernorm.weight.bin", model_file_type);
+> 
+>     if (int8_mode_ == 0) {        
+>         loadWeightFromBin<T>(weights_ptr[2],
+144d223
+<     deviceFill(weights_ptr[3], (size_t)(3 * hidden_units_ / tensor_para_size_), (T)0.0);
+146c225
+<     loadWeightFromBin<T>(weights_ptr[4],
+---
+>         loadWeightFromBin<T>(weights_ptr[4],
+150,152d228
+<     if (!use_gptj_residual_) {
+<         deviceFill(weights_ptr[5], (size_t)hidden_units_, (T)0.0);
+<     }
+154,155c230
+<     // FIXME(sunpeng17): check if the weights are correct
+<     loadWeightFromBin<T>(weights_ptr[6],
+---
+>         loadWeightFromBin<T>(weights_ptr[6],
+159d233
+<     deviceFill(weights_ptr[7], (size_t)(inter_size_ / tensor_para_size_), (T)0.0);
+161,162c235,236
+<     loadWeightFromBin<T>(weights_ptr[8],
+<                          {(size_t)hidden_units_, (size_t)(inter_size_ / tensor_para_size_)},
+---
+>         loadWeightFromBin<T>(weights_ptr[8],
+>                          {(size_t)(inter_size_ / tensor_para_size_), (size_t)hidden_units_},
+165,167c239
+<     deviceFill(weights_ptr[9], (size_t)(inter_size_ / tensor_para_size_), (T)0.0);
+< 
+<     loadWeightFromBin<T>(weights_ptr[10],
+---
+>         loadWeightFromBin<T>(weights_ptr[10],
+171c243,272
+<     deviceFill(weights_ptr[11], (size_t)(hidden_units_), (T)0.0);
+---
+>     }
+>     else if (int8_mode_ == 1) {
+>         loadWeightFromBinAndQuantizeForWeightOnly<T>(int8_weights_ptr[0],
+>                                                      weight_only_scale_ptr[0],
+>                                                      {(size_t)hidden_units_, (size_t)(3 * hidden_units_ / tensor_para_size_)},
+>                                                      dir_path + ".attention.query_key_value.weight." + rank_spec + ".bin",
+>                                                      model_file_type);
+> 
+>         loadWeightFromBinAndQuantizeForWeightOnly<T>(int8_weights_ptr[1],
+>                                                      weight_only_scale_ptr[1],
+>                                                      {(size_t)(hidden_units_ / tensor_para_size_), (size_t)hidden_units_},
+>                                                      dir_path + ".attention.dense.weight." + rank_spec + ".bin",
+>                                                      model_file_type);
+> 
+>         loadWeightFromBinAndQuantizeForWeightOnly<T>(int8_weights_ptr[2],
+>                                                      weight_only_scale_ptr[2],
+>                                                      {(size_t)hidden_units_, (size_t)(inter_size_ / tensor_para_size_)},
+>                                                      dir_path + ".mlp.gate_proj.weight." + rank_spec + ".bin",
+>                                                      model_file_type);
+> 
+>         loadWeightFromBinAndQuantizeForWeightOnly<T>(int8_weights_ptr[3],
+>                                                      weight_only_scale_ptr[3],
+>                                                      {(size_t)hidden_units_, (size_t)(inter_size_ / tensor_para_size_)},
+>                                                      dir_path + ".mlp.up_proj.weight." + rank_spec + ".bin",
+>                                                      model_file_type);
+>         loadWeightFromBinAndQuantizeForWeightOnly<T>(int8_weights_ptr[4],
+>                                                      weight_only_scale_ptr[4],
+>                                                      {(size_t)(inter_size_ / tensor_para_size_), (size_t)hidden_units_},
+>                                                      dir_path + ".mlp.down_proj.weight." + rank_spec + ".bin",
+>                                                      model_file_type);
+173,175c274
+<     deviceFill(weights_ptr[12], (size_t)(hidden_units_), (T)0.0);
+<     loadWeightFromBin<T>(
+<         weights_ptr[13], {(size_t)hidden_units_}, dir_path + ".post_attention_layernorm.weight.bin", model_file_type);
+---
+>     }
+196a296,312
+> 
+>     if (int8_mode_ != 0) {
+>         self_attention_weights.query_weight.int8_kernel                 = int8_weights_ptr[0];
+>         self_attention_weights.attention_output_weight.int8_kernel      = int8_weights_ptr[1];
+>         ffn_weights.intermediate_weight.int8_kernel                     = int8_weights_ptr[2];
+>         ffn_weights.intermediate_weight2.int8_kernel                    = int8_weights_ptr[3];
+>         ffn_weights.output_weight.int8_kernel                           = int8_weights_ptr[4];
+> 
+>         if (int8_mode_ == 1) {
+>             self_attention_weights.query_weight.weight_only_quant_scale                 = weight_only_scale_ptr[0];
+>             self_attention_weights.attention_output_weight.weight_only_quant_scale      = weight_only_scale_ptr[1];
+>             ffn_weights.intermediate_weight.weight_only_quant_scale                     = weight_only_scale_ptr[2];
+>             ffn_weights.intermediate_weight2.weight_only_quant_scale                    = weight_only_scale_ptr[3];
+>             ffn_weights.output_weight.weight_only_quant_scale                           = weight_only_scale_ptr[4];
+>         }
+>     }
+>     
+205c321
+<     deviceMalloc(&weights_ptr[2], hidden_units_ * 3 * hidden_units_ / tensor_para_size_); // qkv kernel
+---
+>     // deviceMalloc(&weights_ptr[2], hidden_units_ * 3 * hidden_units_ / tensor_para_size_); // qkv kernel
+207c323
+<     deviceMalloc(&weights_ptr[4], hidden_units_ / tensor_para_size_ * hidden_units_); // attention output weight
+---
+>     // deviceMalloc(&weights_ptr[4], hidden_units_ / tensor_para_size_ * hidden_units_); // attention output weight
+212c328
+<     deviceMalloc(&weights_ptr[6], hidden_units_ * inter_size_ / tensor_para_size_); // intermediate_weight kernel
+---
+>     // deviceMalloc(&weights_ptr[6], hidden_units_ * inter_size_ / tensor_para_size_); // intermediate_weight kernel
+214c330
+<     deviceMalloc(&weights_ptr[8], hidden_units_ * inter_size_ / tensor_para_size_); // intermediate_weight2 kernel
+---
+>     // deviceMalloc(&weights_ptr[8], hidden_units_ * inter_size_ / tensor_para_size_); // intermediate_weight2 kernel
+216c332
+<     deviceMalloc(&weights_ptr[10], inter_size_ / tensor_para_size_ * hidden_units_); // output_weight kernel
+---
+>     // deviceMalloc(&weights_ptr[10], inter_size_ / tensor_para_size_ * hidden_units_); // output_weight kernel
+219a336,362
+> 
+>     if (int8_mode_ == 0) {
+>         deviceMalloc(&weights_ptr[2], hidden_units_ * 3 * hidden_units_ / tensor_para_size_);  // qkv weight
+>         deviceMalloc(&weights_ptr[4], hidden_units_ / tensor_para_size_ * hidden_units_);  // attention output weight
+>         deviceMalloc(&weights_ptr[6], hidden_units_ * inter_size_ / tensor_para_size_);   // intermediate_weight kernel
+>         deviceMalloc(&weights_ptr[8], hidden_units_ * inter_size_ / tensor_para_size_);  // intermediate_weight2 kernel
+>         deviceMalloc(&weights_ptr[10],  inter_size_ / tensor_para_size_ * hidden_units_);  // output_weight kernel    
+>     }
+>     else {
+>         // Alloc FFN and Attention int8 weights
+>         deviceMalloc(&int8_weights_ptr[0], hidden_units_ * 3 * hidden_units_ / tensor_para_size_);
+>         deviceMalloc(&int8_weights_ptr[1], hidden_units_ / tensor_para_size_ * hidden_units_);
+>         deviceMalloc(&int8_weights_ptr[2], hidden_units_ * inter_size_ / tensor_para_size_);
+>         deviceMalloc(&int8_weights_ptr[3], hidden_units_ * inter_size_ / tensor_para_size_);
+>         deviceMalloc(&int8_weights_ptr[4], inter_size_ / tensor_para_size_ * hidden_units_);
+> 
+> 
+>         if (int8_mode_ == 1) {
+>             // Alloc scales for weight only quant for attention and FFN weights
+>             deviceMalloc(&weight_only_scale_ptr[0], 3 * hidden_units_ / tensor_para_size_);
+>             deviceMalloc(&weight_only_scale_ptr[1], hidden_units_);
+>             deviceMalloc(&weight_only_scale_ptr[2], inter_size_ / tensor_para_size_);
+>             deviceMalloc(&weight_only_scale_ptr[3], inter_size_ / tensor_para_size_);
+>             deviceMalloc(&weight_only_scale_ptr[4], hidden_units_);
+>         }
+>     }
+> 
+diff -r src/fastertransformer/models/llama/LlamaDecoderLayerWeight.h tmp/FasterTransformer/src/fastertransformer/models/llama/LlamaDecoderLayerWeight.h
+31a32
+>     LlamaDecoderLayerWeight(const int int8_mode);
+36c37,38
+<                             const bool use_gptj_residual = true);
+---
+>                             const bool use_gptj_residual = true,
+>                             const int int8_mode = 0);
+56a59,62
+>     int       int8_mode_ = 0;
+> 
+>     std::vector<int8_t*> int8_weights_ptr = std::vector<int8_t*>(5, nullptr);
+>     std::vector<T*>      weight_only_scale_ptr = std::vector<T*>(5, nullptr);
+59a66
+>     void copyFrom(const LlamaDecoderLayerWeight& other);
+diff -r src/fastertransformer/models/llama/Llama.h tmp/FasterTransformer/src/fastertransformer/models/llama/Llama.h
+43a44
+>     float       shared_contexts_ratio_;
+56a58
+>     const int     int8_mode_      = 0;
+85d86
+<     T*       padded_embedding_bias_;
+122a124,128
+>     int* shared_contexts_idx_  = nullptr;
+>     int* compact_idx_          = nullptr;
+>     int* batch_to_compact_idx_ = nullptr;
+>     int* compact_size_         = nullptr;
+> 
+125,126d130
+<     T*     normed_context_decoder_output_buf_;
+<     float* context_nccl_logits_buf_;
+169a174
+>           int                                 int8_mode                = 0,
+171c176,177
+<           int                                 enable_custom_all_reduce = 0);
+---
+>           int                                 enable_custom_all_reduce = 0,
+>           float                               shared_contexts_ratio    = 1.0f);
+199a206
+>           int                                 int8_mode                = 0,
+201c208,209
+<           int                                 enable_custom_all_reduce = 0);
+---
+>           int                                 enable_custom_all_reduce = 0,
+>           float                               shared_contexts_ratio    = 1.0f);
+223,226d230
+< 
+<     size_t getVocabSize() {
+<         return vocab_size_padded_;
+<     }
+diff -r src/fastertransformer/models/llama/LlamaWeight.cc tmp/FasterTransformer/src/fastertransformer/models/llama/LlamaWeight.cc
+31a32
+>                             const int                                  int8_mode,
+43a45
+>     int8_mode_(int8_mode),
+65c67
+<                 hidden_units_, inter_size_, tensor_para_size_, tensor_para_rank_, use_gptj_residual_));
+---
+>                 hidden_units_, inter_size_, tensor_para_size_, tensor_para_rank_, use_gptj_residual_, int8_mode_));
+89a92
+>         post_decoder_embedding.bias = nullptr;
+105a109
+>     int8_mode_(other.int8_mode_),
+151a156
+>     int8_mode_                  = other.int8_mode_;
+194a200
+>     post_decoder_embedding.bias   = nullptr;
+diff -r src/fastertransformer/models/llama/LlamaWeight.h tmp/FasterTransformer/src/fastertransformer/models/llama/LlamaWeight.h
+40a41
+>         const int                                  int8_mode            = 0,
+89a91,92
+> 
+>     size_t int8_mode_    = 0;
+diff -r src/fastertransformer/triton_backend/llama/LlamaTritonModel.cc tmp/FasterTransformer/src/fastertransformer/triton_backend/llama/LlamaTritonModel.cc
+37c37
+<     if (data_type == "half") {
+---
+>     if (data_type == "half" || data_type == "fp16") {
+42c42,43
+<             model_dir);
+---
+>             model_dir,
+>             reader.GetInteger("ft_instance_hyperparameter", "int8_mode", 0));
+50c51,52
+<             model_dir);
+---
+>             model_dir,
+>             reader.GetInteger("ft_instance_hyperparameter", "int8_mode", 0));
+58c60,61
+<             model_dir);
+---
+>             model_dir,
+>             reader.GetInteger("ft_instance_hyperparameter", "int8_mode", 0));
+66c69,70
+<                                       std::string model_dir):
+---
+>                                       std::string model_dir,
+>                                       int         int8_mode):
+70c74,75
+<     enable_custom_all_reduce_(enable_custom_all_reduce)
+---
+>     enable_custom_all_reduce_(enable_custom_all_reduce),
+>     int8_mode_(int8_mode)
+186a192
+>                      int8_mode_,
+215a222
+>                                                                         int8_mode_,
+232a240
+>        << "\nint8_mode: " << int8_mode_
+diff -r src/fastertransformer/triton_backend/llama/LlamaTritonModel.h tmp/FasterTransformer/src/fastertransformer/triton_backend/llama/LlamaTritonModel.h
+33c33,34
+<                      std::string model_dir);
+---
+>                      std::string model_dir,
+>                      int         int8_mode);
+70a72,73
+> 
+>     int  int8_mode_ = 0;
+diff -r src/fastertransformer/triton_backend/llama/LlamaTritonModelInstance.cc tmp/FasterTransformer/src/fastertransformer/triton_backend/llama/LlamaTritonModelInstance.cc
+204,208d203
+<         output_tensors.insert({"logits",
+<                                ft::Tensor{ft::MEMORY_GPU,
+<                                           ft::TYPE_FP32,
+<                                           std::vector<size_t>{request_batch_size * beam_width, total_output_len - max_request_output_len, gpt_->getVocabSize()},
+<                                           d_logits_}});
+254d248
+<     d_logits_ = (float*)(allocator_->reMalloc(d_logits_, sizeof(float) * request_batch_size * beam_width * (total_output_len - max_request_output_len) * gpt_->getVocabSize(), false));
+264d257
+<     allocator_->free((void**)(&d_logits_));
+diff -r src/fastertransformer/triton_backend/llama/LlamaTritonModelInstance.h tmp/FasterTransformer/src/fastertransformer/triton_backend/llama/LlamaTritonModelInstance.h
+79d78
+<     float* d_logits_           = nullptr;
